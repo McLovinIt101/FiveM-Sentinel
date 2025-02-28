@@ -1,68 +1,80 @@
-# FiveM XDP Filter for TCP/UDP Protection
+# FiveM XDP Filter for TCP/UDP Protection (Optimized)
 
-This project is an XDP (eXpress Data Path) program designed to provide advanced protection for FiveM game servers, filtering both TCP and UDP traffic. It includes connection tracking, rate limiting, and blocklist/allowlist mechanisms to mitigate DDoS attacks and enhance server security.
+This project is an **XDP (eXpress Data Path)** program designed to protect FiveM game servers against a wide range of network attacks. It provides comprehensive **TCP/UDP filtering**, **rate limiting**, **connection tracking**, **SYN flood protection** (with SYN cookies), **blocklist/allowlist** support, **deep packet inspection**, **anomaly detection**, **ML-based threat detection**, and **TCP bypass protection**—all while running at the kernel level for high performance.
 
 ## Features
 
-- **TCP/UDP Filtering**: Inspects both UDP and TCP packets for traffic destined to the FiveM server.
-- **Rate Limiting**: Limits the number of packets per second allowed to the FiveM server, protecting against flood attacks.
-- **Connection Tracking**: Tracks both TCP and UDP flows using a flow key derived from IP addresses and ports.
-- **SYN Flood Protection**: Drops excessive TCP SYN packets to mitigate SYN flood attacks.
-- **Dynamic Blocklist/Allowlist**: Allows blocking and allowing IP addresses dynamically via BPF maps.
-- **High Performance**: Runs in the kernel using XDP, which offers high-speed packet filtering before traffic reaches user space.
-- **Deep Packet Inspection**: Analyzes packet payloads for known attack patterns.
-- **Anomaly Detection**: Identifies unusual traffic patterns using statistical methods.
-- **Machine Learning-Based Threat Detection**: Uses a trained model to detect threats based on normal and attack traffic patterns.
-- **TCP Bypass Protection**: Inspects TCP flags and sequence numbers to detect and mitigate TCP bypass attacks.
-- **Enhanced SYN Flood Protection**: Implements SYN cookie mechanism to provide additional protection against SYN flood attacks.
+1. **TCP/UDP Filtering**  
+   - Filters and inspects UDP/TCP packets that target the configured FiveM server IP/port. Other packets pass through without overhead.
+
+2. **Rate Limiting**  
+   - Per-CPU rate limit to cap the packet rate and throttle volumetric DDoS attacks.
+
+3. **Connection Tracking**  
+   - Maintains state for both UDP and TCP flows using an LRU hash map, enabling stateful inspection (e.g., blocking out-of-sequence TCP packets).
+
+4. **Dynamic Blocklist/Allowlist**  
+   - Instantly drop traffic from blacklisted IPs and short-circuit allowlisted IPs for minimal CPU overhead.
+
+5. **SYN Flood Mitigation**  
+   - Protects against SYN floods with SYN cookies, verifying TCP sequence numbers before allowing connections.
+
+6. **Deep Packet Inspection (DPI)**  
+   - Matches payload patterns against known malicious signatures in a BPF map, dropping those packets immediately.
+
+7. **Anomaly Detection**  
+   - Uses an anomaly score map to identify suspicious behavior and drop out-of-profile traffic.
+
+8. **Machine Learning-Based Threat Detection**  
+   - Integrates with an external ML model for adaptive threat detection by looking up flagged flows in a BPF map.
+
+9. **TCP Bypass Protection**  
+   - Drops suspicious TCP packets that attempt to bypass the normal 3-way handshake, preventing stealth scanning and other bypass methods.
+
+10. **High Performance**  
+    - Runs via XDP at the driver layer, ensuring minimal latency and efficient CPU usage.
+
+---
 
 ## How It Works
 
-1. **Packet Inspection**:
-   - The filter parses Ethernet, IP, TCP, and UDP headers to ensure proper bounds and checks for target IP and port (FiveM server).
-   
-2. **Rate Limiting**:
-   - A per-CPU rate limiting mechanism ensures that no more than a defined number of packets per second are allowed to the server.
-   
-3. **Blocklist/Allowlist**:
-   - The filter checks incoming packets against a dynamically updated blocklist/allowlist of IP addresses. Blocked IP addresses will have their packets dropped, while allowed IP addresses bypass all filters.
+1. **Initial Parsing**  
+   - At the **XDP hook**, the program parses Ethernet and IP headers to validate packet length and determine if the traffic is IPv4.
 
-4. **Connection Tracking**:
-   - The filter tracks active UDP and TCP connections using an LRU hash map to maintain flow state and enhance stateful filtering capabilities.
-   
-5. **SYN Flood Protection**:
-   - The filter detects and drops TCP SYN packets to prevent SYN flood attacks on the server, a common DDoS vector.
-   - Enhanced with SYN cookie mechanism to provide additional protection against SYN flood attacks.
+2. **Blocklist/Allowlist**  
+   - Immediately drops packets from blocklisted IPs or passes packets from allowlisted IPs—saving CPU time for known decisions.
 
-6. **Deep Packet Inspection**:
-   - The filter analyzes packet payloads for known attack patterns using a hash map of known patterns.
+3. **Destination Check**  
+   - Only applies deeper inspection if the packet targets the configured FiveM IP and port (other traffic is passed).
 
-7. **Anomaly Detection**:
-   - The filter uses statistical methods to identify unusual traffic patterns and assigns anomaly scores to flows.
+4. **Protocol-Specific Checks**  
+   - **UDP**: Prevents amplification attacks from known amplifier ports, checks DPI signatures, and consults anomaly/ML maps.  
+   - **TCP**: Validates SYNs via SYN cookie, ensures the flow is in correct state, performs DPI, and checks anomaly/ML maps.
 
-8. **Machine Learning-Based Threat Detection**:
-   - The filter uses a trained machine learning model to detect threats based on normal and attack traffic patterns.
+5. **Rate Limiting**  
+   - Maintains a per-CPU timestamp of the last packet sent to the server. Drops if packets arrive too quickly per second.
 
-9. **TCP Bypass Protection**:
-   - The filter inspects TCP flags and sequence numbers to detect and mitigate TCP bypass attacks.
+6. **Connection Tracking**  
+   - Uses an LRU map keyed by a “5-tuple” flow key to track recently seen flows. Ensures TCP packets follow legitimate handshake sequences.
+
+---
 
 ## Installation Guide
 
-### Prerequisites
+### 1. Prerequisites
 
-1. **Kernel with XDP Support**:
-   - Ensure your Linux kernel supports XDP (`iproute2` tools with XDP support is a requirement).
-   - Kernel versions 4.18+ are recommended.
+- **Kernel with XDP Support**  
+  A kernel version **4.18+** is recommended with `iproute2` that supports XDP.
 
-2. **BPF Compiler**:
-   - Install the `clang` and `llvm` tools to compile the XDP program.
+- **BPF Compiler (clang, llvm)**  
+  Install `clang` and `llvm` to compile the BPF program.
 
-3. **iproute2**:
-   - Install `iproute2` utilities to manage XDP programs.
+- **iproute2**  
+  Required to attach/detach the XDP program.
 
-```bash
-sudo apt-get update
-sudo apt-get install clang llvm libelf-dev iproute2
+  ```bash
+  sudo apt-get update
+  sudo apt-get install clang llvm libelf-dev iproute2
 ```
 
 4. **libbpf**:
