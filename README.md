@@ -1,238 +1,247 @@
-# FiveM XDP Filter for TCP/UDP Protection (Optimized)
+# FiveM-Sentinel
 
-This project is an **XDP (eXpress Data Path)** program designed to protect FiveM game servers against a wide range of network attacks. It provides comprehensive **TCP/UDP filtering**, **rate limiting**, **connection tracking**, **SYN flood protection** (with SYN cookies), **blocklist/allowlist** support, **deep packet inspection**, **anomaly detection**, **ML-based threat detection**, and **TCP bypass protection**—all while running at the kernel level for high performance.
+A layered DDoS filter for FiveM / FXServer. It combines a **kernel-level XDP
+program** for line-rate L3/L4 mitigation (UDP floods, SYN floods, reflection)
+with an **nginx micro-cache** and **FXServer hardening** for the Layer-7 problem
+every FiveM operator eventually hits: people spamming `players.json` /
+`info.json` / `dynamic.json` until the server thread stalls and the server drops
+offline.
 
-## Features
+It is honest about where each problem is solved. XDP is great at dropping junk
+packets cheaply; it is *not* the right place to reassemble TCP streams or cache
+JSON, so that work lives in nginx. Each layer does what it is actually good at.
 
-1. **TCP/UDP Filtering**  
-   - Filters and inspects UDP/TCP packets that target the configured FiveM server IP/port. Other packets pass through without overhead.
-
-2. **Rate Limiting**  
-   - Per-CPU rate limit to cap the packet rate and throttle volumetric DDoS attacks.
-
-3. **Connection Tracking**  
-   - Maintains state for both UDP and TCP flows using an LRU hash map, enabling stateful inspection (e.g., blocking out-of-sequence TCP packets).
-
-4. **Dynamic Blocklist/Allowlist**  
-   - Instantly drop traffic from blacklisted IPs and short-circuit allowlisted IPs for minimal CPU overhead.
-
-5. **SYN Flood Mitigation**  
-   - Protects against SYN floods with SYN cookies, verifying TCP sequence numbers before allowing connections.
-
-6. **Deep Packet Inspection (DPI)**  
-   - Matches payload patterns against known malicious signatures in a BPF map, dropping those packets immediately.
-
-7. **Anomaly Detection**  
-   - Uses an anomaly score map to identify suspicious behavior and drop out-of-profile traffic.
-
-8. **Machine Learning-Based Threat Detection**  
-   - Integrates with an external ML model for adaptive threat detection by looking up flagged flows in a BPF map.
-
-9. **TCP Bypass Protection**  
-   - Drops suspicious TCP packets that attempt to bypass the normal 3-way handshake, preventing stealth scanning and other bypass methods.
-
-10. **High Performance**  
-    - Runs via XDP at the driver layer, ensuring minimal latency and efficient CPU usage.
+```
+                         ┌─────────────────────────────────────────────┐
+   Internet  ───────────▶│  Filter / proxy host                        │
+   (players + attackers) │                                             │
+                         │   NIC ──▶ XDP (sentinel)   L3/L4, line rate │
+                         │            │  drop: UDP flood, amp, bad SYN, │
+                         │            │        bad flags, blocklisted,  │
+                         │            │        JSON-endpoint spam       │
+                         │            │  XDP_TX SYN-ACK cookies         │
+                         │            ▼                                 │
+                         │   nft SYNPROXY  ── validates handshake ACK   │
+                         │            │                                 │
+                         │            ├─▶ nginx :443  L7 cache+limit ──▶ FXServer
+                         │            │     players/info/dynamic.json     :30120
+                         │            └─▶ nginx stream :30120 (UDP/TCP) ─▶ (game)
+                         └─────────────────────────────────────────────┘
+```
 
 ---
 
-## How It Works
+## What it protects against
 
-1. **Initial Parsing**  
-   - At the **XDP hook**, the program parses Ethernet and IP headers to validate packet length and determine if the traffic is IPv4.
+| Vector | Layer | How |
+| --- | --- | --- |
+| UDP flood on the game port | XDP | per-source token bucket; spoofed sources self-evict from an LRU map |
+| UDP reflection / amplification | XDP | drop UDP whose **source** port is a known reflector (DNS/NTP/SSDP/memcached/…) |
+| TCP SYN flood | XDP + nft | XDP issues SYN-cookie SYN-ACKs with `XDP_TX`; nftables SYNPROXY validates the ACK |
+| Port/stealth scans, flag-evasion | XDP | drop NULL/XMAS/SYN+FIN/SYN+RST/bare-FIN and unsolicited SYN-ACK |
+| `getinfo`/`getstatus` reflection/amplification | XDP | detect Quake-style connectionless packets (`0xFFFFFFFF` prefix), drop malformed, strict per-source limiter for the ~37x amplification vector |
+| `players.json`/`info.json`/`dynamic.json`/`/client` spam | XDP + nginx + Cloudflare | XDP per-source request-line limiter; nginx micro-cache; Cloudflare edge cache + rate limits (see [deploy/cloudflare.md](deploy/cloudflare.md)) |
+| Spoofed UDP floods | XDP (opt-in) | cross-layer anti-spoof gate: game UDP is gated until that IP completes a TCP `POST /client` (`--require-connect`) |
+| Spoofed/martian sources | XDP | drop bogon source addresses (0/8, 127/8, 169.254/16, 224/4, 240/4) — excludes RFC1918/CGNAT used by proxies |
+| Ping floods | XDP (opt-in) | per-source ICMP token bucket (`--icmp-rps`) |
+| IP fragmentation tricks | XDP | drop fragments aimed at the game port |
+| Known-bad sources | XDP | allow/block lists with TTLs; optional `--auto` promotion of chronic offenders |
 
-2. **Blocklist/Allowlist**  
-   - Immediately drops packets from blocklisted IPs or passes packets from allowlisted IPs—saving CPU time for known decisions.
+### What it is **not**
 
-3. **Destination Check**  
-   - Only applies deeper inspection if the packet targets the configured FiveM IP and port (other traffic is passed).
-
-4. **Protocol-Specific Checks**  
-   - **UDP**: Prevents amplification attacks from known amplifier ports, checks DPI signatures, and consults anomaly/ML maps.  
-   - **TCP**: Validates SYNs via SYN cookie, ensures the flow is in correct state, performs DPI, and checks anomaly/ML maps.
-
-5. **Rate Limiting**  
-   - Maintains a per-CPU timestamp of the last packet sent to the server. Drops if packets arrive too quickly per second.
-
-6. **Connection Tracking**  
-   - Uses an LRU map keyed by a “5-tuple” flow key to track recently seen flows. Ensures TCP packets follow legitimate handshake sequences.
+- Not a substitute for upstream/network-provider scrubbing against truly
+  volumetric (100Gbps+) attacks — XDP drops cheaply but your uplink still has to
+  receive the packets. Pair it with provider-level protection or a tunnel for
+  large attacks.
+- The in-XDP L7 limiter only sees the **first TCP segment** of a request, so it
+  catches the common single-packet request-line flood. Multi-segment and
+  slow-loris style abuse is handled by the nginx layer. Use both.
 
 ---
 
-## Installation Guide
+## Requirements
 
-### 1. Prerequisites
+- **Linux kernel 6.8+** with BTF (`CONFIG_DEBUG_INFO_BTF=y`) — required for the
+  raw XDP SYN-cookie helpers (`bpf_tcp_raw_gen_syncookie_ipv4`) and CO-RE.
+- `clang`/`llvm`, `libbpf` (≥ 1.0) + headers, `bpftool`, `libelf`, `zlib`.
+- A NIC driver with native XDP for best performance (the loader automatically
+  falls back to generic/SKB mode otherwise).
+- `nftables` with `CONFIG_NFT_SYNPROXY` for the TCP handshake path; `nginx`
+  (with the `stream` module) for the L7 cache.
 
-- **Kernel with XDP Support**  
-  A kernel version **4.18+** is recommended with `iproute2` that supports XDP.
+Install (Debian/Ubuntu):
 
-- **BPF Compiler (clang, llvm)**  
-  Install `clang` and `llvm` to compile the BPF program.
-
-- **iproute2**  
-  Required to attach/detach the XDP program.
-
-  ```bash
-  sudo apt-get update
-  sudo apt-get install clang llvm libelf-dev iproute2
-```
-
-4. **libbpf**:
-   - You will also need the libbpf library to handle BPF map interactions.
-   ```bash
-   sudo apt-get install libbpf-dev
-   ```
-
-5. **Python**:
-   - Install Python and necessary libraries for training the machine learning model.
-   ```bash
-   sudo apt-get install python3 python3-pip
-   pip3 install scikit-learn numpy pandas
-   ```
-
-### Building and Loading the XDP Filter
-
-1. Clone the Repository:
-   ```bash
-   git clone https://github.com/McLovinIt101/FiveM-XDP-Filter-for-TCP-UDP-Protection.git
-   cd FiveM-XDP-Filter-for-TCP-UDP-Protection
-   ```
-
-2. Compile the XDP Program:
-   - You can compile the XDP filter using clang and llvm. Ensure you target the BPF architecture.
-   ```bash
-   clang -O2 -target bpf -c fivem_xdp.c -o fivem_xdp.o
-   ```
-
-3. Load the XDP Program:
-   - Use the ip utility to attach the XDP program to a network interface (replace eth0 with the appropriate network interface on your machine).
-   ```bash
-   sudo ip link set dev eth0 xdp obj fivem_xdp.o sec xdp_program
-   ```
-   - This will load the XDP program and start filtering packets on the specified interface.
-
-4. Verifying XDP Program Status:
-   - You can verify that the XDP program is successfully attached using:
-   ```bash
-   ip -details link show dev eth0
-   ```
-   - Look for the xdp section in the output to confirm that the program is running.
-
-### Managing the Blocklist and Allowlist
-
-The blocklist and allowlist are managed through BPF maps that can be accessed from user space. You can dynamically add or remove IP addresses from these lists using tools like bpftool.
-
-1. Adding IP to Blocklist:
-   ```bash
-   bpftool map update id <map_id> key <ip_address_in_hex> value 1
-   ```
-
-2. Adding IP to Allowlist:
-   ```bash
-   bpftool map update id <map_id> key <ip_address_in_hex> value 1
-   ```
-
-3. Deleting IP from Blocklist/Allowlist:
-   ```bash
-   bpftool map delete id <map_id> key <ip_address_in_hex>
-   ```
-
-   - To find the map ID, run:
-   ```bash
-   bpftool map show
-   ```
-
-### Unloading the XDP Program
-
-To unload the XDP program from the interface, run:
 ```bash
-sudo ip link set dev eth0 xdp off
+sudo apt-get update
+sudo apt-get install -y clang llvm libbpf-dev libelf-dev zlib1g-dev \
+                        linux-tools-common linux-tools-$(uname -r) \
+                        nftables nginx
 ```
-This will remove the XDP program from the specified interface.
 
-## Configuration
+---
 
-- **FIVEM_SERVER_IP**: The IP address of your FiveM server (default is 127.0.0.1 for local testing).
-- **FIVEM_SERVER_PORT**: The UDP and TCP port number your FiveM server uses (default is 30120).
-- **MAX_PACKET_RATE**: The maximum number of packets per second allowed from each connection (default is 13000).
-- **BLOCKED_IP_LIST_MAX**: The maximum number of entries in the blocklist/allowlist (default is 128).
+## Build
 
-You can modify these parameters directly in the fivem_xdp.c file and recompile the program.
-
-## Training and Using the Machine Learning Model
-
-### Training the Model
-
-1. **Collect Data**:
-   - Collect normal and attack traffic data. Save the data in CSV format with appropriate labels.
-
-2. **Train the Model**:
-   - Use the following Python script to train a machine learning model using scikit-learn:
-
-   ```python
-   import pandas as pd
-   from sklearn.model_selection import train_test_split
-   from sklearn.ensemble import RandomForestClassifier
-   from sklearn.metrics import accuracy_score
-   import joblib
-
-   # Load data
-   data = pd.read_csv('traffic_data.csv')
-   X = data.drop('label', axis=1)
-   y = data['label']
-
-   # Split data into training and testing sets
-   X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-   # Train the model
-   model = RandomForestClassifier(n_estimators=100, random_state=42)
-   model.fit(X_train, y_train)
-
-   # Evaluate the model
-   y_pred = model.predict(X_test)
-   print(f'Accuracy: {accuracy_score(y_test, y_pred)}')
-
-   # Save the model
-   joblib.dump(model, 'ml_model.joblib')
-   ```
-
-3. **Deploy the Model**:
-   - Convert the trained model to a format that can be used in the XDP program. This may involve exporting the model to a C header file or using a custom format.
-
-### Using the Model in the XDP Program
-
-1. **Load the Model**:
-   - Load the trained model into the XDP program. This may involve reading the model from a file or embedding it directly in the code.
-
-      #### Embedding the Model Directly in the Code
-   - Convert the trained model into a C array or a similar format that can be included in the XDP program.
-   - For example, if the model is a decision tree, you can convert it into a series of if-else statements or a lookup table.
-
-   ```c
-   // Example of embedding a simple decision tree model
-   int predict_threat(__u64 flow_key) {
-       // Example decision tree logic
-       if (flow_key < 1000) {
-           return 0;  // Not a threat
-       } else if (flow_key < 2000) {
-           return 1;  // Threat
-       } else {
-           return 0;  // Not a threat
-       }
-   }
-   ```
-
-2. **Feature Extraction**:
-   - Extract features from incoming packets and use the model to predict whether the packet is a threat.
-
-3. **Threat Detection**:
-   - Use the model's predictions to drop packets flagged as threats.
-
-## Debugging
-
-You can use the bpf_trace_printk() function in the XDP program to print debug messages to the kernel log. This is useful for debugging packet flows and understanding how your filter is performing.
-
-To view the kernel log:
 ```bash
-sudo dmesg | tail
+make            # generates tools/vmlinux.h, builds build/sentinel.bpf.o + build/sentinel
+sudo make install   # installs the CLI to /usr/local/sbin/sentinel
 ```
+
+`make` regenerates `tools/vmlinux.h` from the running kernel's BTF the first
+time. To refresh it for a different kernel: `make vmlinux`.
+
+---
+
+## Quick start
+
+```bash
+# Attach to the public NIC and protect your FXServer's address:
+sudo sentinel load --iface eth0 --ip 203.0.113.10 --port 30120
+
+# Watch what it's doing:
+sudo sentinel stats --watch
+
+# Detach:
+sudo sentinel unload --iface eth0
+```
+
+The program stays attached and its maps stay pinned under
+`/sys/fs/bpf/fivem-sentinel/` after `load` returns, so the other commands work
+without reloading. Then set up the L7 layer:
+
+1. Edit and apply `deploy/nginx-fivem.conf` (cache + rate limit the JSON
+   endpoints, proxy the rest).
+2. Edit and apply `deploy/nftables-synproxy.conf` and its sysctls (handshake
+   validation for the XDP SYN-cookie path).
+3. Append `deploy/server.cfg.snippet` to your FXServer `server.cfg`
+   (indirect listing, `sv_endpointPrivacy`, split HTTP/UDP listeners).
+
+---
+
+## CLI reference
+
+```
+sentinel load   --iface IF --ip A.B.C.D [--port N] [tunables] [--mode drv|skb] [--auto]
+sentinel unload --iface IF
+sentinel stats  [--watch]
+sentinel block   A.B.C.D [ttl_seconds]     # ttl 0 / omitted = permanent
+sentinel unblock A.B.C.D
+sentinel allow   A.B.C.D                    # bypass all filtering for this IP
+sentinel unallow A.B.C.D
+sentinel list                              # show allow/block lists
+```
+
+### Tunables (load)
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--udp-pps` / `--udp-burst` | 2000 / 4000 | per-source UDP packet rate / burst |
+| `--syn-pps` / `--syn-burst` | 200 / 400 | per-source new-connection (SYN) rate / burst |
+| `--l7-rps` / `--l7-burst` | 5 / 15 | per-source rate for `*.json` and `/client` requests |
+| `--oob-rps` / `--oob-burst` | 5 / 15 | per-source rate for `getinfo`/`getstatus` OOB queries |
+| `--block-ttl` | 600 | TTL (s) applied by `--auto` blocks |
+| `--mode` | drv→skb | XDP attach mode |
+| `--no-syn-cookies` | off | disable in-XDP SYN-cookie generation (use plain SYN rate limit + kernel/nft SYNPROXY instead) |
+| `--no-bogon` | off | disable martian/bogon source dropping (on by default) |
+| `--require-connect` | off | **anti-spoof gate**: drop game UDP from IPs that haven't done a TCP `POST /client` |
+| `--connect-ttl` | 120 | seconds an IP stays validated after a `/client` POST |
+| `--icmp-rps` | off | enable + set per-source ICMP rate limit |
+| `--drop-bad-client-method` | off | drop non-POST requests to `/client` |
+| `--auto` | off | foreground loop that auto-blocks chronic rate-limit offenders |
+
+Defaults are deliberately generous for legitimate players; tune `--udp-pps`
+down only if you have measured your real per-client packet rate.
+
+> **Anti-spoof gate caveat:** `--require-connect` assumes the TCP `/client`
+> handshake and the game UDP arrive with the **same** client source IP — true
+> when Sentinel runs directly on the FiveM host (or a same-IP proxy). It is
+> **not** safe when the connect endpoint is fronted by a different-IP
+> proxy/Cloudflare while UDP is direct, which is why it is off by default.
+
+---
+
+## How the XDP pipeline works
+
+Decisions are ordered cheapest-first so junk dies before any expensive work
+(`src/sentinel.bpf.c`):
+
+1. Parse Ethernet/IPv4 (CO-RE).
+2. **Config gate** — ignore anything not addressed to the protected `ip:port`.
+3. **Allow / block lists** (per source IP; blocks carry an expiry).
+4. **Bogon drop** — martian source addresses can't be a real client.
+5. **Fragment drop** for the game port.
+6. **UDP** — drop reflector source ports; if the payload is a Quake-style
+   connectionless query (`getinfo`/`getstatus`), apply the strict OOB limiter;
+   otherwise apply the optional anti-spoof gate, then the per-source token bucket.
+7. **TCP** — drop illegal flag combos; per-source SYN token bucket; on a pure
+   SYN, generate a cookie and `XDP_TX` the SYN-ACK; on established data, classify
+   the HTTP request line (`*.json` + `/client`), rate-limit it, and validate the
+   source for the UDP gate on a real `POST /client`.
+8. **ICMP** — optional per-source token bucket.
+9. **Stats** — every decision bumps a per-CPU counter (read via `sentinel stats`).
+
+The SYN-cookie **ACK validation and connection splice are delegated to nftables
+SYNPROXY**, which shares the kernel's cookie secret. XDP only generates the
+SYN-ACK — the part that has to run at line rate during a flood. This mirrors the
+kernel's own `tools/testing/selftests/bpf/progs/xdp_synproxy_kern.c`.
+
+> The XDP SYN-ACK advertises an MSS option only (no window scale / SACK /
+> timestamps) to keep the in-kernel packet rewrite minimal and robust. That is
+> fine for FiveM's small TCP exchanges. To advertise more options, extend
+> `emit_syn_cookie()` and match them in the nft `synproxy` rule.
+
+---
+
+## Observability
+
+`sentinel stats` aggregates the per-CPU counters by reason, e.g.:
+
+```
+counter              packets
+-------------------- ----------------
+pass                 184223
+drop_udp_rate        59210
+drop_amplification   12044
+drop_syn_rate        331
+syn_cookie_tx        128
+drop_l7_rate         872
+drop_blocklist       40
+```
+
+---
+
+## Security / operational notes
+
+- Run the filter on the box that actually receives the traffic (the proxy host
+  in the topology above, or the FXServer host itself if you don't proxy).
+- `allow`-list your own management IPs so you can never lock yourself out.
+- The maps are pinned under `/sys/fs/bpf/fivem-sentinel/`; `unload` removes them.
+- If you can't run kernel 6.8+, load with `--no-syn-cookies` and rely on the
+  nft SYNPROXY config (which also works standalone) for SYN protection.
+
+---
+
+## Project layout
+
+```
+src/sentinel.bpf.c   XDP data plane (CO-RE)
+src/sentinel.h       structs/enums shared by BPF + userspace
+src/sentinel.c       libbpf control plane / CLI
+deploy/nginx-fivem.conf       L7 cache + per-IP rate limits
+deploy/nftables-synproxy.conf SYNPROXY pairing for the SYN-cookie path
+deploy/server.cfg.snippet     FXServer hardening
+deploy/cloudflare.md          edge L7 protection (cache + rate limits + WAF)
+tools/gen_vmlinux.sh          BTF -> vmlinux.h helper
+Makefile
+```
+
+## Roadmap / extension points
+
+- IPv6 path (the data plane is IPv4-only today).
+- GeoIP / ASN allow-block integration in the `--auto` loop.
+- Prometheus exporter for the stats map.
+
+## License
+
+MIT (see `LICENSE`). The BPF object is built as `Dual MIT/GPL` because the raw
+SYN-cookie kernel helpers are GPL-only.

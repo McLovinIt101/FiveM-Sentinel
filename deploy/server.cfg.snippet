@@ -1,0 +1,40 @@
+# =============================================================================
+# FiveM-Sentinel — server.cfg hardening snippet
+#
+# Append these to your FXServer server.cfg. They make the reverse proxy the only
+# public face of the server, hide player endpoints/IPs, and let you split the
+# raw game port from the HTTP port so the latter can be firewalled.
+#
+# Reference: https://docs.fivem.net/docs/server-manual/proxy-setup/
+# =============================================================================
+
+# --- Indirect listing: clients reach you via the proxy, not your real IP ------
+# If you front the connect endpoint with Cloudflare (see deploy/cloudflare.md),
+# set this to the proxied hostname (e.g. connect.example.com) so the JSON
+# endpoints are fetched through Cloudflare's cache + rate limiting.
+set sv_forceIndirectListing true
+set sv_listingHostOverride "server1.example.com"   # your proxy / Cloudflare hostname
+set sv_proxyIPRanges "100.64.1.1/32"               # the proxy host(s) only
+set sv_endpoints "100.64.1.2:30120"                # this FXServer's real address
+
+# --- Privacy: don't leak player identifiers / IPs via the JSON endpoints ------
+# Greatly reduces the value of scraping players.json and is a defense-in-depth
+# measure alongside the nginx cache + XDP rate limiter.
+set sv_endpointPrivacy true
+
+# --- Asset CDN through the caching proxy --------------------------------------
+set adhesive_cdnKey "CHANGE_ME_to_a_long_random_secret"
+fileserver_add ".*" "https://server1.example.com/files"
+
+# --- Split the listeners so HTTP (TCP) can be firewalled from the public ------
+# Keep UDP game traffic public on 30120; move the embedded HTTP/TCP to an
+# internal port that only the proxy (and your firewall) can reach. Then block
+# tcp/30120 (or tcp/30121) from the public so players.json can ONLY be served
+# through the cached nginx vhost.
+endpoint_add_udp "0.0.0.0:30120"
+endpoint_add_tcp "127.0.0.1:30121"
+
+# Example firewall intent (apply with nft/iptables, not here):
+#   - allow  udp/30120        from anywhere   (game)
+#   - allow  tcp/30121        from proxy only  (HTTP backend)
+#   - block  tcp/30121        from public
